@@ -1,0 +1,21 @@
+# 本地记录，不上传
+record.txt
+
+# 训练权重与常见模型二进制
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store

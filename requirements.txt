@@ -1,0 +1,11 @@
+# Tiny GPT-2 baseline：训练/推理
+# CUDA 版本请按 https://pytorch.org/get-started/locally/ 选择 pip 命令安装 torch，勿混用 CPU 与 CUDA 的 wheel。
+torch>=2.1.0
+
+# train.py memmap 语料
+numpy>=1.24.0
+
+matplotlib>=3.7.0
+
+# tokenizer 进度条
+tqdm>=4.64.0
