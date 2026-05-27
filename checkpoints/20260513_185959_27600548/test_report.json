@@ -1,8 +1,0 @@
-{
-  "test_jsonl": "/root/autodl-tmp/data/test.jsonl",
-  "num_pred_positions": 33752576,
-  "mean_cross_entropy": 4.38420769003499,
-  "perplexity": 80.17467484740081,
-  "bpc": 6.3250746926407375,
-  "eval_note": "Per-line text with trailing <eos>, then concatenated; non-overlapping blocks; differs from per-document perplexity."
-}

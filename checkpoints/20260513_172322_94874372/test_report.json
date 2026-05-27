@@ -1,8 +1,0 @@
-{
-  "test_jsonl": "/root/autodl-tmp/data/test.jsonl",
-  "num_pred_positions": 32990208,
-  "mean_cross_entropy": 4.819776116071823,
-  "perplexity": 123.93734009492543,
-  "bpc": 6.9534671008518885,
-  "eval_note": "顺序拼接各行 text 后按不重叠 block 切窗；与「单条超长文本」全量困惑度定义略有差别。"
-}

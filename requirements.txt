@@ -9,3 +9,6 @@ matplotlib>=3.7.0
 
 # tokenizer 进度条
 tqdm>=4.64.0
+
+# GPT-2 BPE 分词器（--tokenizer gpt2）
+transformers>=4.36.0

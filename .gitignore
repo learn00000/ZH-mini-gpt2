@@ -1,6 +1,18 @@
 # 本地记录，不上传
 record.txt
 
+# 训练产物与实验输出
+checkpoints/
+report/
+badcase_runs/
+logs/
+attn_vis/
+
+# 语料与数据集（保留 scripts/ 下的处理代码）
+data/
+*.jsonl
+*.jsonl.gz
+
 # 训练权重与常见模型二进制
 *.pt
 *.pth
@@ -14,6 +26,9 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# HuggingFace 缓存
+.cache/
 
 # 编辑器与系统
 .idea/

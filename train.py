@@ -3,8 +3,8 @@
 Mini GPT-2（中文、字级）训练入口。
 
 【prepare 在做什么】
-  把 JSONL（每行 {"text": "..."}）按 char_tokenizer 编成 token id；每条非空样本在末尾追加
-  <eos>，再将各条顺序拼接（packed）写入 train.bin / valid.bin（uint16 memmap）。
+  把 JSONL（每行 {"text": "..."}）按分词器（字级 char 或 GPT-2 BPE）编成 token id；每条样本可加 <bos>/<eos>、
+  末尾加 <eos>，再将各条顺序拼接（packed）写入 train.bin / valid.bin（uint16 memmap）。
   训练时随机切长度为 block_size 的窗口，不必把整份 JSONL 一次性读进内存。
 
 【checkpoint】
@@ -14,7 +14,8 @@ Mini GPT-2（中文、字级）训练入口。
 
 【用法】
   python train.py prepare --split data [--prepare_force]
-  python train.py train --split data --device cuda --max_steps 10000
+  python train.py train --split data --device cuda --max_steps 20000
+  显存不足时可保持等效 batch：例如 --batch_size 16 --gradient_accumulation_steps 2
 
 默认数据根目录 /root/autodl-tmp；本地可改 --data_root。
 """
@@ -37,7 +38,7 @@ import torch
 from model.config import GPTConfig
 from model.gpt import TinyGPT
 from model.summary import print_model_summary
-from tokenizer.train_char_tokenizer import CharTokenizer
+from tokenizer import Tokenizer, load_tokenizer, vocab_size_of
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -55,17 +56,25 @@ class TrainConfig:
     data_root: str = "/root/autodl-tmp"
     split: str = "minidata"
     tokenizer_dir: str = ""
+    tokenizer_backend: str = "char"  # char | gpt2
     token_cache_dir: str = ""
     train_jsonl: str = "train.jsonl"
     valid_jsonl: str = "valid.jsonl"
     text_field: str = "text"
 
     block_size: int = 256
-    n_layer: int = 6
-    n_head: int = 4
-    n_embd: int = 384
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
     dropout: float = 0.1
+    attn_dropout: float = 0.0  # 0 表示与 dropout 相同；B2 用 0.2
     bias: bool = True
+    pos_encoding: str = "wpe"  # wpe | rope（实验 A1，已完成勿与 A2 同开）
+    rope_theta: float = 10000.0
+    attn_window: int = 0  # 0=全长；>0 为 A2 滑动窗口 W（须 pos_encoding=wpe）
+    talking_heads: bool = False  # B1：与 --rope 同开
+    norm_type: str = "layernorm"  # layernorm | rmsnorm
+    ffn_type: str = "gelu"  # gelu | swiglu
 
     learning_rate: float = 6e-4
     weight_decay: float = 0.1
@@ -74,30 +83,38 @@ class TrainConfig:
     grad_clip: float = 1.0
     warmup_steps: int = 200
     lr_decay_ratio: float = 0.1
-    max_steps: int = 10_000
+    max_steps: int = 20_000
     batch_size: int = 32
     gradient_accumulation_steps: int = 1
 
     seed: int = 42
     device: str = "cuda"
     eval_interval: int = 200
-    eval_iters: int = 50
+    eval_iters: int = 200
     log_interval: int = 10
     checkpoint_dir: str = "checkpoints"
     resume: str = ""
     no_loss_plot: bool = False  # True 时不生成 loss_curve.png（仍写 loss_history.json）
     # 训练结束后在测试集上评估 best.pt（默认 {data_root}/data/test.jsonl）
-    test_jsonl: str = ""  # 空则用 data/test.jsonl；可填绝对路径或相对 data_root 的相对路径
+    test_jsonl: str = ""  # 空则优先 {split}/test.jsonl，否则回退 data/test.jsonl
     no_test_after_train: bool = False  # True 则跳过测试集评估
 
     prepare_force: bool = False
     prepare_max_lines: Optional[int] = None
 
     def resolved_tokenizer_dir(self) -> str:
-        return self.tokenizer_dir or os.path.join(self.data_root, "char_tokenizer")
+        if self.tokenizer_dir:
+            return self.tokenizer_dir
+        if self.tokenizer_backend == "gpt2":
+            return os.path.join(self.data_root, "gpt2_tokenizer")
+        return os.path.join(self.data_root, "char_tokenizer")
 
     def resolved_token_cache_dir(self) -> str:
-        return self.token_cache_dir or os.path.join(self.data_root, f"tokens_{self.split}")
+        if self.token_cache_dir:
+            return self.token_cache_dir
+        if self.tokenizer_backend == "gpt2":
+            return os.path.join(self.data_root, f"tokens_gpt2_{self.split}")
+        return os.path.join(self.data_root, f"tokens_{self.split}")
 
     def dataset_dir(self) -> str:
         return os.path.join(self.data_root, self.split)
@@ -115,6 +132,9 @@ class TrainConfig:
                 if os.path.isabs(self.test_jsonl)
                 else os.path.join(self.data_root, self.test_jsonl)
             )
+        split_test = os.path.join(self.dataset_dir(), "test.jsonl")
+        if os.path.isfile(split_test):
+            return split_test
         return os.path.join(self.data_root, "data", "test.jsonl")
 
     def to_dict(self) -> Dict[str, Any]:
@@ -153,7 +173,7 @@ def _get_lr(step: int, *, max_steps: int, warmup_steps: int, max_lr: float, min_
 
 def _encode_lines(
     path: str,
-    tok: CharTokenizer,
+    tok: Tokenizer,
     text_field: str,
     dtype: np.dtype,
     max_lines: Optional[int],
@@ -173,7 +193,7 @@ def _encode_lines(
             text = obj.get(text_field, "")
             if not text:
                 continue
-            chunk.extend(tok.encode(text, add_bos=False, add_eos=True))
+            chunk.extend(tok.encode(text, add_bos=True, add_eos=True))
             while len(chunk) >= chunk_cap:
                 yield np.asarray(chunk[:chunk_cap], dtype=dtype)
                 chunk = chunk[chunk_cap:]
@@ -184,13 +204,13 @@ def _encode_lines(
 def _build_token_memmap(
     jsonl_path: str,
     out_bin_path: str,
-    tok: CharTokenizer,
+    tok: Tokenizer,
     *,
     text_field: str = "text",
     dtype: np.dtype = np.uint16,
     max_lines: Optional[int] = None,
 ) -> int:
-    if len(tok.token_to_id) >= 65536:
+    if vocab_size_of(tok) >= 65536:
         raise ValueError("词表 >= 65536 请改用 uint32")
     total = 0
     os.makedirs(os.path.dirname(out_bin_path) or ".", exist_ok=True)
@@ -257,8 +277,8 @@ def prepare(tc: TrainConfig) -> None:
         print(f"已存在 {train_bin}，跳过（使用 --prepare_force 覆盖）")
         return
 
-    tok = CharTokenizer.load(tok_dir)
-    vocab_size = len(tok.token_to_id)
+    tok = load_tokenizer(tok_dir)
+    vocab_size = vocab_size_of(tok)
     ml = tc.prepare_max_lines
 
     print(f"编码训练集 -> {train_bin} ...")
@@ -278,9 +298,11 @@ def prepare(tc: TrainConfig) -> None:
         "train_jsonl": train_path,
         "valid_jsonl": valid_path if os.path.isfile(valid_path) else None,
         "tokenizer_dir": tok_dir,
+        "tokenizer_backend": tc.tokenizer_backend,
         "text_field": tc.text_field,
         "prepare_max_lines": ml,
         "append_eos_per_line": True,
+        "append_bos_per_line": True,
     }
     _write_meta(cache_dir, meta)
     print(f"完成：{os.path.join(cache_dir, META_NAME)}")
@@ -443,7 +465,7 @@ def _load_model_state_only(path: str, model: TinyGPT, device: torch.device) -> N
 @torch.no_grad()
 def _evaluate_on_jsonl_sequential(
     model: TinyGPT,
-    tok: CharTokenizer,
+    tok: Tokenizer,
     jsonl_path: str,
     *,
     block_size: int,
@@ -453,8 +475,8 @@ def _evaluate_on_jsonl_sequential(
     max_lines: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    将 jsonl 各行 text 编码为「正文 + <eos>」后顺序拼接为 token 流，按不重叠 block 切成 B 路并行窗口，
-    累积 sum(loss * BT) / 总预测位置 得到 mean CE，再换算 PPL / BPC（与 prepare 的 packed+eos 一致）。
+    将 jsonl 各行 text 编码为「<bos> + 正文 + <eos>」后顺序拼接为 token 流，按不重叠 block 切成 B 路并行窗口，
+    累积 sum(loss * BT) / 总预测位置 得到 mean CE，再换算 PPL / BPC（与 prepare 的 packed+bos+eos 一致）。
     """
     model.eval()
     buf: list[int] = []
@@ -499,7 +521,7 @@ def _evaluate_on_jsonl_sequential(
             text = obj.get(text_field, "")
             if not text:
                 continue
-            buf.extend(tok.encode(text, add_bos=False, add_eos=True))
+            buf.extend(tok.encode(text, add_bos=True, add_eos=True))
             drain()
     drain()
 
@@ -518,7 +540,7 @@ def _evaluate_on_jsonl_sequential(
         "mean_cross_entropy": mean_ce,
         "perplexity": _ce_to_ppl(mean_ce),
         "bpc": _ce_to_bpc(mean_ce),
-        "eval_note": "Per-line text with trailing <eos>, then concatenated; non-overlapping blocks; differs from per-document perplexity.",
+        "eval_note": "Per-line: <bos> + text + <eos>, then concatenated; non-overlapping blocks; differs from per-document perplexity.",
     }
 
 
@@ -543,7 +565,17 @@ def train(tc: TrainConfig) -> None:
             f"未找到 token 缓存：{train_bin}\n请先：python train.py prepare --split {tc.split}"
         )
 
-    vocab_size = int(_read_meta(cache_dir)["vocab_size"])
+    meta = _read_meta(cache_dir)
+    vocab_size = int(meta["vocab_size"])
+    print(f"分词器: {meta.get('tokenizer_backend', tc.tokenizer_backend)}  vocab={vocab_size}")
+    attn_w = tc.attn_window if tc.attn_window > 0 else None
+    if tc.pos_encoding == "rope" and attn_w is not None:
+        raise ValueError("A1(RoPE) 与 A2(滑动窗口) 不能同时开：请去掉 --rope 或 --attn_window/--sliding_window")
+    if tc.talking_heads and attn_w is not None:
+        raise ValueError("B1(Talking-Heads) 与 A2(滑动窗口) 不能同时开")
+    if tc.talking_heads and tc.attn_dropout > 0 and tc.attn_dropout != tc.dropout:
+        raise ValueError("B1 与 B2(attn_dropout) 请分两次训练，勿同开")
+
     gpt_cfg = GPTConfig(
         vocab_size=vocab_size,
         block_size=tc.block_size,
@@ -551,8 +583,26 @@ def train(tc: TrainConfig) -> None:
         n_head=tc.n_head,
         n_embd=tc.n_embd,
         dropout=tc.dropout,
+        attn_dropout=(tc.attn_dropout if tc.attn_dropout > 0 else None),
         bias=tc.bias,
+        pos_encoding=tc.pos_encoding,
+        rope_theta=tc.rope_theta,
+        attn_window=attn_w,
+        talking_heads=tc.talking_heads,
+        norm_type=tc.norm_type,
+        ffn_type=tc.ffn_type,
     )
+    print(f"骨干: norm={gpt_cfg.norm_type} ffn={gpt_cfg.ffn_type}")
+    pe_note = f" (theta={gpt_cfg.rope_theta})" if gpt_cfg.pos_encoding == "rope" else ""
+    print(f"位置编码: {gpt_cfg.pos_encoding}{pe_note}")
+    if gpt_cfg.attn_dropout is not None and gpt_cfg.attn_dropout != gpt_cfg.dropout:
+        print(f"注意力 dropout: {gpt_cfg.attn_dropout}（resid/MLP 仍为 {gpt_cfg.dropout}，实验 B2）")
+    if gpt_cfg.talking_heads:
+        print("注意力: Talking-Heads（实验 B1，softmax 前后头维混合）")
+    if gpt_cfg.attn_window:
+        print(f"注意力窗口: W={gpt_cfg.attn_window}（滑动局部因果，实验 A2）")
+    elif not gpt_cfg.talking_heads:
+        print("注意力: 标准多头（无 Talking-Heads）")
     model = TinyGPT(gpt_cfg).to(device)
     print_model_summary(
         model,
@@ -731,7 +781,7 @@ def train(tc: TrainConfig) -> None:
             print(f"【测试集】未找到文件，跳过：{test_path}")
         else:
             print(f"【测试集】加载 best.pt，评测：{test_path}")
-            tok_eval = CharTokenizer.load(tc.resolved_tokenizer_dir())
+            tok_eval = load_tokenizer(tc.resolved_tokenizer_dir())
             eval_model = TinyGPT(gpt_cfg).to(device)
             _load_model_state_only(best_pt, eval_model, device)
             test_report = _evaluate_on_jsonl_sequential(
@@ -826,12 +876,43 @@ def _apply_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--data_root", type=str, default="/root/autodl-tmp")
     p.add_argument("--split", type=str, default="data")
     p.add_argument("--tokenizer_dir", type=str, default="")
+    p.add_argument(
+        "--tokenizer",
+        type=str,
+        choices=("char", "gpt2"),
+        default="char",
+        help="char=字级词表；gpt2=OpenAI GPT-2 BPE（需先 setup_gpt2_tokenizer + prepare）",
+    )
     p.add_argument("--token_cache_dir", type=str, default="")
 
 
 def _cfg_from_ns(ns: argparse.Namespace) -> TrainConfig:
     names = {f.name for f in fields(TrainConfig)}
-    return TrainConfig(**{k: v for k, v in vars(ns).items() if k in names})
+    cfg = TrainConfig(**{k: v for k, v in vars(ns).items() if k in names})
+    if getattr(ns, "rope", False):
+        cfg.pos_encoding = "rope"
+    if getattr(ns, "sliding_window", False) and cfg.attn_window <= 0:
+        cfg.attn_window = 128
+    if getattr(ns, "b2", False):
+        cfg.attn_dropout = 0.2
+        if cfg.pos_encoding != "rope":
+            cfg.pos_encoding = "rope"
+    backbone = getattr(ns, "backbone", "") or ""
+    if backbone == "a1b1":
+        cfg.pos_encoding = "rope"
+        cfg.talking_heads = True
+    elif backbone in ("a1b1_modern", "v2"):
+        cfg.pos_encoding = "rope"
+        cfg.talking_heads = True
+        cfg.norm_type = "rmsnorm"
+        cfg.ffn_type = "swiglu"
+    if getattr(ns, "swiglu", False):
+        cfg.ffn_type = "swiglu"
+    if getattr(ns, "rmsnorm", False):
+        cfg.norm_type = "rmsnorm"
+    if hasattr(ns, "tokenizer") and ns.tokenizer:
+        cfg.tokenizer_backend = ns.tokenizer
+    return cfg
 
 
 def main() -> None:
@@ -848,11 +929,58 @@ def main() -> None:
     _apply_common(p_tr)
     p_tr.add_argument("--text_field", type=str, default="text")
     p_tr.add_argument("--block_size", type=int, default=256)
-    p_tr.add_argument("--n_layer", type=int, default=6)
-    p_tr.add_argument("--n_head", type=int, default=4)
-    p_tr.add_argument("--n_embd", type=int, default=384)
+    p_tr.add_argument("--n_layer", type=int, default=8)
+    p_tr.add_argument("--n_head", type=int, default=8)
+    p_tr.add_argument("--n_embd", type=int, default=512)
     p_tr.add_argument("--dropout", type=float, default=0.1)
     p_tr.add_argument("--bias", action=argparse.BooleanOptionalAction, default=True)
+    p_tr.add_argument(
+        "--pos_encoding",
+        type=str,
+        choices=("wpe", "rope"),
+        default="wpe",
+        help="wpe=baseline 绝对位置嵌入；rope=实验 A1，Q/K 上 RoPE、无 wpe",
+    )
+    p_tr.add_argument("--rope", action="store_true", help="实验 A1：等同 --pos_encoding rope（勿与滑动窗口同开）")
+    p_tr.add_argument("--rope_theta", type=float, default=10000.0)
+    p_tr.add_argument(
+        "--attn_window",
+        type=int,
+        default=0,
+        help="实验 A2：滑动窗口宽度 W；0=全长。须 wpe，勿与 --rope 同开",
+    )
+    p_tr.add_argument(
+        "--sliding_window",
+        action="store_true",
+        help="实验 A2：等同 --attn_window 128（block_size=256 时看最近一半上下文）",
+    )
+    p_tr.add_argument(
+        "--talking_heads",
+        action="store_true",
+        help="实验 B1：Talking-Heads；建议在 A1 上使用：同时加 --rope",
+    )
+    p_tr.add_argument(
+        "--attn_dropout",
+        type=float,
+        default=0.0,
+        help="仅注意力子层 dropout；0=与 --dropout 相同。B2 典型 0.2",
+    )
+    p_tr.add_argument(
+        "--b2",
+        action="store_true",
+        help="实验 B2：A1(RoPE) + attn_dropout=0.2，resid/MLP 仍为 --dropout",
+    )
+    p_tr.add_argument("--norm_type", type=str, choices=("layernorm", "rmsnorm"), default="layernorm")
+    p_tr.add_argument("--ffn_type", type=str, choices=("gelu", "swiglu"), default="gelu")
+    p_tr.add_argument("--swiglu", action="store_true", help="等同 --ffn_type swiglu")
+    p_tr.add_argument("--rmsnorm", action="store_true", help="等同 --norm_type rmsnorm")
+    p_tr.add_argument(
+        "--backbone",
+        type=str,
+        default="",
+        choices=("", "a1b1", "a1b1_modern", "v2"),
+        help="a1b1=RoPE+B1；a1b1_modern/v2=RoPE+B1+SwiGLU+RMSNorm（推荐下一版骨干）",
+    )
     p_tr.add_argument("--learning_rate", type=float, default=6e-4)
     p_tr.add_argument("--weight_decay", type=float, default=0.1)
     p_tr.add_argument("--beta1", type=float, default=0.9)
@@ -860,13 +988,13 @@ def main() -> None:
     p_tr.add_argument("--grad_clip", type=float, default=1.0)
     p_tr.add_argument("--warmup_steps", type=int, default=200)
     p_tr.add_argument("--lr_decay_ratio", type=float, default=0.1)
-    p_tr.add_argument("--max_steps", type=int, default=10_000)
+    p_tr.add_argument("--max_steps", type=int, default=20_000)
     p_tr.add_argument("--batch_size", type=int, default=32)
     p_tr.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p_tr.add_argument("--seed", type=int, default=42)
     p_tr.add_argument("--device", type=str, default="cuda")
     p_tr.add_argument("--eval_interval", type=int, default=200)
-    p_tr.add_argument("--eval_iters", type=int, default=50)
+    p_tr.add_argument("--eval_iters", type=int, default=200)
     p_tr.add_argument("--log_interval", type=int, default=10)
     p_tr.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p_tr.add_argument("--no_loss_plot", action="store_true", help="不生成 loss_curve.png（仍写 loss_history.json）")
@@ -874,7 +1002,7 @@ def main() -> None:
         "--test_jsonl",
         type=str,
         default="",
-        help="测试集 jsonl；默认 {data_root}/data/test.jsonl；可填绝对路径或相对 data_root 的路径",
+        help="测试集 jsonl；默认 {data_root}/{split}/test.jsonl，不存在则回退 data/test.jsonl",
     )
     p_tr.add_argument("--no_test_after_train", action="store_true", help="训练结束后不在测试集上评测 best.pt")
     p_tr.add_argument("--resume", type=str, default="")
